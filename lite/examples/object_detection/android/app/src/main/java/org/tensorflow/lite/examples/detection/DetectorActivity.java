@@ -18,6 +18,7 @@ package org.tensorflow.lite.examples.detection;
 
 import android.graphics.Bitmap;
 import android.graphics.Bitmap.Config;
+import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Matrix;
@@ -26,13 +27,25 @@ import android.graphics.Paint.Style;
 import android.graphics.RectF;
 import android.graphics.Typeface;
 import android.media.ImageReader.OnImageAvailableListener;
+import android.os.Environment;
+import android.os.Handler;
+import android.os.HandlerThread;
 import android.os.SystemClock;
 import android.util.Size;
 import android.util.TypedValue;
 import android.widget.Toast;
+
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.FileWriter;
 import java.io.IOException;
+import java.util.HashMap;
 import java.util.LinkedList;
 import java.util.List;
+import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
 import org.tensorflow.lite.examples.detection.customview.OverlayView;
 import org.tensorflow.lite.examples.detection.customview.OverlayView.DrawCallback;
 import org.tensorflow.lite.examples.detection.env.BorderedText;
@@ -56,7 +69,7 @@ public class DetectorActivity extends CameraActivity implements OnImageAvailable
   private static final String TF_OD_API_LABELS_FILE = "file:///android_asset/labelmap.txt";
   private static final DetectorMode MODE = DetectorMode.TF_OD_API;
   // Minimum detection confidence to track a detection.
-  private static final float MINIMUM_CONFIDENCE_TF_OD_API = 0.5f;
+  private static final float MINIMUM_CONFIDENCE_TF_OD_API = 0.1f;
   private static final boolean MAINTAIN_ASPECT = false;
   private static final Size DESIRED_PREVIEW_SIZE = new Size(640, 480);
   private static final boolean SAVE_PREVIEW_BITMAP = false;
@@ -81,6 +94,101 @@ public class DetectorActivity extends CameraActivity implements OnImageAvailable
   private MultiBoxTracker tracker;
 
   private BorderedText borderedText;
+
+  @Override
+  public synchronized void onResume() {
+    super.onResume();
+    try {
+      long total = 0;
+      long frameCount = 0;
+      String path = Environment.getExternalStorageDirectory().toString() + "/Download";
+      File directory = new File(path);
+      FileWriter fw = new FileWriter(new File(directory, "detections.csv"));
+      fw.write("time,90,80,70,60,50,40,30,20,10,ms\n");
+      File[] files = directory.listFiles();
+      Classifier detector = TFLiteObjectDetectionAPIModel.create(
+              getAssets(),
+              TF_OD_API_MODEL_FILE,
+              TF_OD_API_LABELS_FILE,
+              TF_OD_API_INPUT_SIZE,
+              TF_OD_API_IS_QUANTIZED);
+      detector.setNumThreads(4);
+      int cropSize = TF_OD_API_INPUT_SIZE;
+      croppedBitmap = Bitmap.createBitmap(cropSize, cropSize, Config.ARGB_8888);
+      BitmapFactory.Options options = new BitmapFactory.Options();
+      options.inPreferredConfig = Bitmap.Config.ARGB_8888;
+      float minimumConfidence = MINIMUM_CONFIDENCE_TF_OD_API;
+      final Paint paint = new Paint();
+      paint.setColor(Color.RED);
+      paint.setStyle(Style.STROKE);
+      paint.setStrokeWidth(2.0f);
+      String pattern = ".*T([^\\.]*)";
+      Pattern r = Pattern.compile(pattern);
+
+      for(File file : files) {
+        if (!file.getName().endsWith(".png")) continue;
+        String nameNoExt = file.getName().substring(0, file.getName().lastIndexOf('.'));
+        Matcher m = r.matcher(nameNoExt);
+        m.find();
+        String timeDashes = m.group(1);
+        String timeColons = timeDashes.replace("-", ":");
+
+        Bitmap bitmap = BitmapFactory.decodeFile(file.getAbsolutePath(), options);
+        frameToCropTransform =
+                ImageUtils.getTransformationMatrix(
+                        bitmap.getWidth(), bitmap.getHeight(),
+                        cropSize, cropSize,
+                        0, MAINTAIN_ASPECT);
+
+        cropToFrameTransform = new Matrix();
+        frameToCropTransform.invert(cropToFrameTransform);
+        final Canvas canvas = new Canvas(croppedBitmap);
+        canvas.drawBitmap(bitmap, frameToCropTransform, null);
+        long start = System.currentTimeMillis();
+        final List<Classifier.Recognition> results = detector.recognizeImage(croppedBitmap);
+        long delta = System.currentTimeMillis() - start;
+        total += delta;
+        frameCount++;
+        Map<Integer,Integer> people = new HashMap<>();
+        for(Classifier.Recognition result : results) {
+          final RectF location = result.getLocation();
+          if (location != null
+                  && result.getConfidence() >= minimumConfidence
+                  && "person".equals(result.getTitle())
+          ) {
+            for(int threshold = 90; threshold >= 10; threshold-=10) {
+                if(result.getConfidence() * 100 >= threshold) {
+                    int prev = people.getOrDefault(threshold, 0);
+                    people.put(threshold, prev+1);
+                }
+            }
+            canvas.drawRect(location, paint);
+          }
+        }
+        String line = timeColons + ",";
+        for(int threshold = 90; threshold >= 10; threshold-=10) {
+          int prev = people.getOrDefault(threshold, 0);
+          line += prev + ",";
+        }
+        line += delta + "\n";
+        System.out.print(line);
+        fw.write(line);
+        File newFile = new File(file.getParent() + "/" + nameNoExt + ".jpg");
+        try (FileOutputStream out = new FileOutputStream(newFile.getAbsolutePath())) {
+          croppedBitmap.compress(Bitmap.CompressFormat.PNG, 100, out);
+        } catch (IOException e) {
+          throw new RuntimeException(e);
+        }
+      }
+      fw.flush();
+      Thread.sleep(1000);
+      fw.close();
+      System.out.println("Analyzed " + frameCount + " images in " + total + "ms");
+    } catch (Exception ex) {
+      throw new RuntimeException(ex);
+    }
+  }
+
 
   @Override
   public void onPreviewSizeChosen(final Size size, final int rotation) {
