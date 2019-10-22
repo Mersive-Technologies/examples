@@ -36,6 +36,7 @@ import java.util.Map;
 import java.util.Vector;
 import org.tensorflow.lite.Interpreter;
 import org.tensorflow.lite.examples.detection.env.Logger;
+import org.tensorflow.lite.gpu.GpuDelegate;
 
 /**
  * Wrapper for frozen detection models trained using the Tensorflow Object Detection API:
@@ -59,7 +60,7 @@ public class TFLiteObjectDetectionAPIModel implements Classifier {
   private int[] intValues;
   // outputLocations: array of shape [Batchsize, NUM_DETECTIONS,4]
   // contains the location of detected boxes
-  private float[][][] outputLocations;
+  private float[][][][] outputLocations;
   // outputClasses: array of shape [Batchsize, NUM_DETECTIONS]
   // contains the classes of detected boxes
   private float[][] outputClasses;
@@ -120,7 +121,11 @@ public class TFLiteObjectDetectionAPIModel implements Classifier {
     d.inputSize = inputSize;
 
     try {
-      d.tfLite = new Interpreter(loadModelFile(assetManager, modelFilename));
+      Interpreter.Options tfliteOptions = new Interpreter.Options();
+      GpuDelegate gpuDelegate = new GpuDelegate();
+      tfliteOptions.addDelegate(gpuDelegate);
+      MappedByteBuffer buff = loadModelFile(assetManager, modelFilename);
+      d.tfLite = new Interpreter(buff, tfliteOptions);
     } catch (Exception e) {
       throw new RuntimeException(e);
     }
@@ -138,7 +143,7 @@ public class TFLiteObjectDetectionAPIModel implements Classifier {
     d.intValues = new int[d.inputSize * d.inputSize];
 
     d.tfLite.setNumThreads(NUM_THREADS);
-    d.outputLocations = new float[1][NUM_DETECTIONS][4];
+    d.outputLocations = new float[1][13][13][425];
     d.outputClasses = new float[1][NUM_DETECTIONS];
     d.outputScores = new float[1][NUM_DETECTIONS];
     d.numDetections = new float[1];
@@ -175,17 +180,11 @@ public class TFLiteObjectDetectionAPIModel implements Classifier {
 
     // Copy the input data into TensorFlow.
     Trace.beginSection("feed");
-    outputLocations = new float[1][NUM_DETECTIONS][4];
-    outputClasses = new float[1][NUM_DETECTIONS];
-    outputScores = new float[1][NUM_DETECTIONS];
-    numDetections = new float[1];
+    outputLocations = new float[1][13][13][425];
 
     Object[] inputArray = {imgData};
     Map<Integer, Object> outputMap = new HashMap<>();
     outputMap.put(0, outputLocations);
-    outputMap.put(1, outputClasses);
-    outputMap.put(2, outputScores);
-    outputMap.put(3, numDetections);
     Trace.endSection();
 
     // Run the inference call.
@@ -193,27 +192,46 @@ public class TFLiteObjectDetectionAPIModel implements Classifier {
     tfLite.runForMultipleInputsOutputs(inputArray, outputMap);
     Trace.endSection();
 
+    // https://medium.com/@y1017c121y/how-does-yolov2-work-daaaa967c5f7
+    final ArrayList<Recognition> recognitions = new ArrayList<>(NUM_DETECTIONS);
+    float[][][] gridCells = outputLocations[0];
+    for(float[][] c1 : gridCells) {
+      for(float[] c2 : c1) {
+        for(int i = 0; i < c2.length; i += labels.size() + 5) {
+          float x = c2[i];
+          float y = c2[i + 1];
+          float w = c2[i + 2];
+          float h = c2[i + 3];
+          float pObj = c2[i + 4];
+          for(int j = 0; j < labels.size(); j++) {
+            float pClass = pObj * c2[j];
+            if(pClass > 0.3) {
+              final RectF detection = new RectF(
+                              x * inputSize,
+                              y * inputSize,
+                              w * inputSize + x * inputSize,
+                              h * inputSize + y * inputSize
+                      );
+              recognitions.add(new Recognition(
+                        "" + j,
+                        labels.get(j),
+                        pClass,
+                        detection)
+              );
+            }
+          }
+        }
+      }
+    }
+
     // Show the best detections.
     // after scaling them back to the input size.
-    final ArrayList<Recognition> recognitions = new ArrayList<>(NUM_DETECTIONS);
-    for (int i = 0; i < NUM_DETECTIONS; ++i) {
-      final RectF detection =
-          new RectF(
-              outputLocations[0][i][1] * inputSize,
-              outputLocations[0][i][0] * inputSize,
-              outputLocations[0][i][3] * inputSize,
-              outputLocations[0][i][2] * inputSize);
-      // SSD Mobilenet V1 Model assumes class 0 is background class
-      // in label file and class labels start from 1 to number_of_classes+1,
-      // while outputClasses correspond to class index from 0 to number_of_classes
-      int labelOffset = 1;
-      recognitions.add(
-          new Recognition(
-              "" + i,
-              labels.get((int) outputClasses[0][i] + labelOffset),
-              outputScores[0][i],
-              detection));
-    }
+//    for (int i = 0; i < NUM_DETECTIONS; ++i) {
+//      // SSD Mobilenet V1 Model assumes class 0 is background class
+//      // in label file and class labels start from 1 to number_of_classes+1,
+//      // while outputClasses correspond to class index from 0 to number_of_classes
+//      int labelOffset = 1;
+//    }
     Trace.endSection(); // "recognizeImage"
     return recognitions;
   }
