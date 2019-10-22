@@ -30,9 +30,11 @@ import java.nio.ByteOrder;
 import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.PriorityQueue;
 import java.util.Vector;
 import org.tensorflow.lite.Interpreter;
 import org.tensorflow.lite.examples.detection.env.Logger;
@@ -44,6 +46,27 @@ import org.tensorflow.lite.gpu.GpuDelegate;
  */
 public class TFLiteObjectDetectionAPIModel implements Classifier {
   private static final Logger LOGGER = new Logger();
+
+  int blockSize = 32;
+  int gridHeight = 13;
+  int gridWidth = 13;
+  int NUM_CLASSES = 80;
+  float THRESHOLD = 0.3f;
+  int MAX_RESULTS = 25;
+  float OVERLAP_THRESHOLD = 0.7f;
+  int NUM_BOXES_PER_BLOCK = 5;
+  float[] anchors = new float[] {
+    0.57273f,
+    0.677385f,
+    1.87446f,
+    2.06253f,
+    3.33843f,
+    5.47434f,
+    7.88282f,
+    3.52778f,
+    9.77052f,
+    9.16828f
+  };
 
   // Only return this many results.
   private static final int NUM_DETECTIONS = 10;
@@ -122,8 +145,8 @@ public class TFLiteObjectDetectionAPIModel implements Classifier {
 
     try {
       Interpreter.Options tfliteOptions = new Interpreter.Options();
-      GpuDelegate gpuDelegate = new GpuDelegate();
-      tfliteOptions.addDelegate(gpuDelegate);
+//      GpuDelegate gpuDelegate = new GpuDelegate();
+//      tfliteOptions.addDelegate(gpuDelegate);
       MappedByteBuffer buff = loadModelFile(assetManager, modelFilename);
       d.tfLite = new Interpreter(buff, tfliteOptions);
     } catch (Exception e) {
@@ -161,19 +184,15 @@ public class TFLiteObjectDetectionAPIModel implements Classifier {
     bitmap.getPixels(intValues, 0, bitmap.getWidth(), 0, 0, bitmap.getWidth(), bitmap.getHeight());
 
     imgData.rewind();
+    int pixel = 0;
     for (int i = 0; i < inputSize; ++i) {
       for (int j = 0; j < inputSize; ++j) {
-        int pixelValue = intValues[i * inputSize + j];
-        if (isModelQuantized) {
-          // Quantized model
-          imgData.put((byte) ((pixelValue >> 16) & 0xFF));
-          imgData.put((byte) ((pixelValue >> 8) & 0xFF));
-          imgData.put((byte) (pixelValue & 0xFF));
-        } else { // Float model
-          imgData.putFloat((((pixelValue >> 16) & 0xFF) - IMAGE_MEAN) / IMAGE_STD);
-          imgData.putFloat((((pixelValue >> 8) & 0xFF) - IMAGE_MEAN) / IMAGE_STD);
-          imgData.putFloat(((pixelValue & 0xFF) - IMAGE_MEAN) / IMAGE_STD);
-        }
+        final int val = intValues[pixel++];
+        int IMAGE_MEAN = 128;
+        float IMAGE_STD = 128.0f;
+        imgData.putFloat((((val >> 16) & 0xFF)- IMAGE_MEAN)/ IMAGE_STD);
+        imgData.putFloat((((val >> 8) & 0xFF)- IMAGE_MEAN)/ IMAGE_STD);
+        imgData.putFloat((((val) & 0xFF)- IMAGE_MEAN)/ IMAGE_STD);
       }
     }
     Trace.endSection(); // preprocessBitmap
@@ -189,51 +208,124 @@ public class TFLiteObjectDetectionAPIModel implements Classifier {
 
     // Run the inference call.
     Trace.beginSection("run");
+    long start = System.currentTimeMillis();
     tfLite.runForMultipleInputsOutputs(inputArray, outputMap);
+    System.out.println("Processed in ms: " + (System.currentTimeMillis() - start));
     Trace.endSection();
 
     // https://medium.com/@y1017c121y/how-does-yolov2-work-daaaa967c5f7
     final ArrayList<Recognition> recognitions = new ArrayList<>(NUM_DETECTIONS);
-    float[][][] gridCells = outputLocations[0];
-    for(float[][] c1 : gridCells) {
-      for(float[] c2 : c1) {
-        for(int i = 0; i < c2.length; i += labels.size() + 5) {
-          float x = c2[i];
-          float y = c2[i + 1];
-          float w = c2[i + 2];
-          float h = c2[i + 3];
-          float pObj = c2[i + 4];
-          for(int j = 0; j < labels.size(); j++) {
-            float pClass = pObj * c2[j];
-            if(pClass > 0.3) {
-              final RectF detection = new RectF(
-                              x * inputSize,
-                              y * inputSize,
-                              w * inputSize + x * inputSize,
-                              h * inputSize + y * inputSize
-                      );
-              recognitions.add(new Recognition(
-                        "" + j,
-                        labels.get(j),
-                        pClass,
-                        detection)
-              );
+    List<Map<String, Object>> detections = postProcess(outputLocations[0]);
+
+    Trace.endSection(); // "recognizeImage"
+    return recognitions;
+  }
+
+  public List<Map<String, Object>> postProcess(final float[][][] output) {
+    // Find the best detections.
+    PriorityQueue<Map<String, Object>> priorityQueue = new PriorityQueue<>(1, new PredictionComparator());
+
+    for (int y = 0; y < gridHeight; ++y) {
+      for (int x = 0; x < gridWidth; ++x) {
+        for (int b = 0; b < NUM_BOXES_PER_BLOCK; ++b) {
+          final int offset = (NUM_CLASSES + 5) * b;
+
+          final float confidence = expit(output[y][x][offset + 4]);
+
+          int detectedClass = -1;
+          float maxClass = 0;
+
+          final float[] classes = new float[NUM_CLASSES];
+          for (int c = 0; c < NUM_CLASSES; ++c) {
+            classes[c] = output[x][y][offset + 5 + c];
+          }
+          softmax(classes);
+
+          for (int c = 0; c < NUM_CLASSES; ++c) {
+            if (classes[c] > maxClass) {
+              detectedClass = c;
+              maxClass = classes[c];
             }
+          }
+
+          final float confidenceInClass = maxClass * confidence;
+//          System.out.println("" + confidenceInClass);
+          if (confidenceInClass >  THRESHOLD) {
+            Map<String, Object> prediction = new HashMap<>();
+            prediction.put("classIndex",detectedClass);
+            prediction.put("confidence",confidenceInClass);
+            final float xPos = (x + expit(output[y][x][offset + 0])) * blockSize;
+            final float yPos = (y + expit(output[y][x][offset + 1])) * blockSize;
+
+            final float w = (float) (Math.exp(output[y][x][offset + 2]) * anchors[2 * b + 0]) * blockSize;
+            final float h = (float) (Math.exp(output[y][x][offset + 3]) * anchors[2 * b + 1]) * blockSize;
+
+            Map<String, Float> rectF = new HashMap<>();
+            rectF.put("left", Math.max(0, xPos - w / 2)); // left should have lower value as right
+            rectF.put("top", Math.max(0, yPos - h / 2));  // top should have lower value as bottom
+            rectF.put("right",Math.min(640- 1, xPos + w / 2));
+            rectF.put("bottom",Math.min(480 - 1, yPos + h / 2));
+            prediction.put("rect",rectF);
+            priorityQueue.add(prediction);
           }
         }
       }
     }
 
-    // Show the best detections.
-    // after scaling them back to the input size.
-//    for (int i = 0; i < NUM_DETECTIONS; ++i) {
-//      // SSD Mobilenet V1 Model assumes class 0 is background class
-//      // in label file and class labels start from 1 to number_of_classes+1,
-//      // while outputClasses correspond to class index from 0 to number_of_classes
-//      int labelOffset = 1;
-//    }
-    Trace.endSection(); // "recognizeImage"
-    return recognitions;
+    final List<Map<String, Object>> predictions = new ArrayList<>();
+    Map<String, Object> bestPrediction = priorityQueue.poll();
+    predictions.add(bestPrediction);
+
+    for (int i = 0; i < Math.min(priorityQueue.size(), MAX_RESULTS); ++i) {
+      Map<String, Object> prediction = priorityQueue.poll();
+      boolean overlaps = false;
+      for (Map<String, Object> previousPrediction : predictions) {
+        float intersectProportion = 0f;
+        Map<String, Float> primary = (Map<String, Float>) previousPrediction.get("rect");
+        Map<String, Float> secondary =  (Map<String, Float>) prediction.get("rect");
+        if (primary.get("left") < secondary.get("right") && primary.get("right") > secondary.get("left")
+                && primary.get("top") < secondary.get("bottom") && primary.get("bottom") > secondary.get("top")) {
+          float intersection = Math.max(0, Math.min(primary.get("right"), secondary.get("right")) - Math.max(primary.get("left"), secondary.get("left"))) *
+                  Math.max(0, Math.min(primary.get("bottom"), secondary.get("bottom")) - Math.max(primary.get("top"), secondary.get("top")));
+
+          float main = Math.abs(primary.get("right") - primary.get("left")) * Math.abs(primary.get("bottom") - primary.get("top"));
+          intersectProportion= intersection / main;
+        }
+
+        overlaps = overlaps || (intersectProportion > OVERLAP_THRESHOLD);
+      }
+
+      if (!overlaps) {
+        predictions.add(prediction);
+      }
+    }
+    return predictions;
+  }
+
+  private float expit(final float x) {
+    return (float) (1. / (1. + Math.exp(-x)));
+  }
+
+  private void softmax(final float[] vals) {
+    float max = Float.NEGATIVE_INFINITY;
+    for (final float val : vals) {
+      max = Math.max(max, val);
+    }
+    float sum = 0.0f;
+    for (int i = 0; i < vals.length; ++i) {
+      vals[i] = (float) Math.exp(vals[i] - max);
+      sum += vals[i];
+    }
+    for (int i = 0; i < vals.length; ++i) {
+      vals[i] = vals[i] / sum;
+    }
+  }
+
+  private class PredictionComparator implements Comparator<Map<String, Object>> {
+    @Override
+    public int compare(final Map<String, Object> prediction1, final Map<String, Object> prediction2) {
+      return Float.compare((float)prediction2.get("confidence"), (float)prediction1.get("confidence"));
+    }
   }
 
   @Override
